@@ -1,41 +1,65 @@
-import { getStore } from "@netlify/blobs";
+// netlify/functions/games.js
 
-export default async (request) => {
-  const store = getStore("mindspark");
-  const key = "games";
+let games = [];
 
-  const PASSWORD = process.env.MINDS_PW || "game123";
-  const provided = request.headers.get("x-mindspark-password");
+exports.handler = async (event) => {
+  const headers = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type, x-mindspark-password",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  };
 
-  if (request.method === "GET") {
-    const data = await store.get(key, { type: "json" });
-    return new Response(JSON.stringify(data ?? []), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 200, headers, body: "" };
   }
 
-  if (provided !== PASSWORD) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
+  if (event.httpMethod === "GET") {
+    return {
+      statusCode: 200,
+      headers,
+      body: JSON.stringify(games),
+    };
   }
 
-  if (request.method === "POST") {
-    const body = await request.json();
-    if (!Array.isArray(body)) {
-      return new Response(JSON.stringify({ error: "Expected an array" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
+  if (event.httpMethod === "POST") {
+    const pw =
+      event.headers["x-mindspark-password"] ||
+      event.headers["X-Mindspark-Password"];
+
+    const expected = process.env.MINDS_PW || "game123";
+
+    if (!pw || pw !== expected) {
+      return {
+        statusCode: 401,
+        headers,
+        body: JSON.stringify({ error: "Unauthorized" }),
+      };
     }
-    await store.set(key, body);
-    return new Response(JSON.stringify({ ok: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
+
+    try {
+      const data = JSON.parse(event.body);
+      if (Array.isArray(data)) {
+        games = data;
+      }
+    } catch (e) {
+      return {
+        statusCode: 400,
+        headers,
+        body: JSON.stringify({ error: "Invalid JSON" }),
+      };
+    }
+
+    return {
+      statusCode: 200,
+      headers,
+      body: JSON.stringify({ ok: true, count: games.length }),
+    };
   }
 
-  return new Response("Method Not Allowed", { status: 405 });
+  return {
+    statusCode: 405,
+    headers,
+    body: JSON.stringify({ error: "Method Not Allowed" }),
+  };
 };
