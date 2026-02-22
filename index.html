@@ -481,333 +481,446 @@
   </div>
 
   <script>
-    class GameLinkSaver {
-      constructor() {
-        // IMPORTANT: This must match Netlify env var MINDS_PW (we will set later)
-        this.PASSWORD = "game123";
+  class GameLinkSaver {
+    constructor() {
+      // IMPORTANT: This must match Netlify env var MINDS_PW
+      this.PASSWORD = "game123";
 
-        this.apiUrl = "/.netlify/functions/games";
-        this.storageKey = "mindSparkGames_v1";
+      this.apiUrl = "/.netlify/functions/games";
+      this.storageKey = "mindSparkGames_v2"; // changed to avoid old buggy cache
 
-        this.games = this.loadLocal(); // Offline-first
-        this.initializeEventListeners();
+      this.games = this.loadLocal(); // Offline-first
+      this.initializeEventListeners();
+      this.renderGames();
+      this.updateStats();
+
+      // Online sync (best effort)
+      this.syncFromServer();
+
+      // Auto-sync when back online
+      window.addEventListener("online", () => this.syncFromServer());
+
+      // Optional: periodic sync
+      setInterval(() => this.syncFromServer(true), 12000);
+    }
+
+    initializeEventListeners() {
+      const addBtn = document.getElementById("addGameBtn");
+      const urlInput = document.getElementById("gameUrl");
+      const syncBtn = document.getElementById("syncBtn");
+
+      addBtn.addEventListener("click", () => this.addGame());
+      urlInput.addEventListener("keypress", (e) => {
+        if (e.key === "Enter") this.addGame();
+      });
+      urlInput.addEventListener("blur", () => this.autoFetchGameInfo());
+
+      syncBtn.addEventListener("click", () => this.syncFromServer(false));
+    }
+
+    async autoFetchGameInfo() {
+      const url = document.getElementById("gameUrl").value.trim();
+      const titleInput = document.getElementById("gameTitle");
+      if (url && !titleInput.value) {
+        try {
+          const domain = new URL(url).hostname.replace("www.", "");
+          titleInput.value = `Game from ${domain}`;
+        } catch (e) {}
+      }
+    }
+
+    isValidURL(string) {
+      try {
+        new URL(string);
+        return string.startsWith("http://") || string.startsWith("https://");
+      } catch (_) {
+        return false;
+      }
+    }
+
+    extractTitleFromURL(url) {
+      try {
+        const urlObj = new URL(url);
+        const domain = urlObj.hostname.replace("www.", "");
+        const path = urlObj.pathname.split("/").filter((p) => p).pop();
+        if (path && path !== domain)
+          return path.replace(/[-_]/g, " ").replace(/\.(html|php|aspx?)$/i, "");
+        return `Game from ${domain}`;
+      } catch (e) {
+        return "Untitled Game";
+      }
+    }
+
+    getGameNumber(index) {
+      return (index + 1).toString();
+    }
+
+    escapeHtml(text) {
+      const div = document.createElement("div");
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // ---------------- OFFLINE STORAGE ----------------
+    saveLocal() {
+      try {
+        localStorage.setItem(this.storageKey, JSON.stringify(this.games));
+      } catch (e) {}
+    }
+
+    loadLocal() {
+      try {
+        const data = JSON.parse(localStorage.getItem(this.storageKey));
+        return Array.isArray(data) ? data : [];
+      } catch (e) {
+        return [];
+      }
+    }
+
+    // ---------------- ONLINE STORAGE ----------------
+    async loadFromServer() {
+      const res = await fetch(this.apiUrl, { cache: "no-store" });
+      if (!res.ok) throw new Error("Server GET failed");
+      const data = await res.json();
+      return Array.isArray(data) ? data : [];
+    }
+
+    async saveToServer() {
+      const res = await fetch(this.apiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-mindspark-password": this.PASSWORD,
+        },
+        body: JSON.stringify(this.games),
+      });
+      if (!res.ok) {
+        if (res.status === 401)
+          throw new Error("Unauthorized (password mismatch)");
+        throw new Error("Server POST failed");
+      }
+    }
+
+    // ---------------- MERGE (FIXED) ----------------
+    keyOf(game) {
+      // stable merge key:
+      // use id if available; fallback url|title
+      if (game && (typeof game.id === "number" || typeof game.id === "string")) {
+        return `id:${game.id}`;
+      }
+      return `ut:${String(game?.url || "").trim()}|${String(game?.title || "").trim()}`.toLowerCase();
+    }
+
+    toTime(str) {
+      const t = Date.parse(str || "");
+      return Number.isFinite(t) ? t : 0;
+    }
+
+    // Merge by latest updatedAt (or dateAdded)
+    mergeLists(localList, serverList) {
+      const map = new Map();
+
+      const put = (g) => {
+        const k = this.keyOf(g);
+        const existing = map.get(k);
+        if (!existing) {
+          map.set(k, g);
+          return;
+        }
+        const existingT = this.toTime(existing.updatedAt || existing.dateAdded);
+        const incomingT = this.toTime(g.updatedAt || g.dateAdded);
+        if (incomingT >= existingT) map.set(k, g);
+      };
+
+      (serverList || []).forEach(put);
+      (localList || []).forEach(put);
+
+      const merged = Array.from(map.values());
+      merged.sort(
+        (a, b) =>
+          this.toTime(b.updatedAt || b.dateAdded) -
+          this.toTime(a.updatedAt || a.dateAdded)
+      );
+
+      // decide if we should push to server:
+      // if local has any item newer than server version, push
+      let pushLocalToServer = false;
+      const serverMap = new Map();
+      (serverList || []).forEach((g) => serverMap.set(this.keyOf(g), g));
+
+      for (const g of localList || []) {
+        const k = this.keyOf(g);
+        const s = serverMap.get(k);
+        const localT = this.toTime(g.updatedAt || g.dateAdded);
+        const serverT = this.toTime(s?.updatedAt || s?.dateAdded);
+        if (localT > serverT) {
+          pushLocalToServer = true;
+          break;
+        }
+      }
+
+      return { merged, pushLocalToServer };
+    }
+
+    async syncFromServer(silent = true) {
+      if (!navigator.onLine) return;
+      try {
+        const serverGames = await this.loadFromServer();
+        const localGames = this.games || [];
+
+        const { merged, pushLocalToServer } = this.mergeLists(localGames, serverGames);
+
+        this.games = merged;
+        this.saveLocal();
         this.renderGames();
         this.updateStats();
 
-        // Online sync (best effort)
-        this.syncFromServer();
-
-        // Auto-sync when back online
-        window.addEventListener("online", () => this.syncFromServer());
-
-        // Optional: periodic sync
-        setInterval(() => this.syncFromServer(true), 12000);
-      }
-
-      initializeEventListeners() {
-        const addBtn = document.getElementById('addGameBtn');
-        const urlInput = document.getElementById('gameUrl');
-        const syncBtn = document.getElementById('syncBtn');
-
-        addBtn.addEventListener('click', () => this.addGame());
-        urlInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') this.addGame(); });
-        urlInput.addEventListener('blur', () => this.autoFetchGameInfo());
-
-        syncBtn.addEventListener('click', () => this.syncFromServer(false));
-      }
-
-      async autoFetchGameInfo() {
-        const url = document.getElementById('gameUrl').value.trim();
-        const titleInput = document.getElementById('gameTitle');
-        if (url && !titleInput.value) {
-          try {
-            const domain = new URL(url).hostname.replace('www.', '');
-            titleInput.value = `Game from ${domain}`;
-          } catch (e) {}
+        if (pushLocalToServer) {
+          await this.saveToServer();
         }
-      }
 
-      isValidURL(string) {
-        try { new URL(string); return string.startsWith('http://') || string.startsWith('https://'); }
-        catch (_) { return false; }
+        if (!silent) this.showNotification("Synced ✅", "success");
+      } catch (e) {
+        console.error(e);
+        if (!silent) this.showNotification("Sync failed (check Netlify setup)", "error");
       }
+    }
 
-      extractTitleFromURL(url) {
+    async persistAndMaybeSync() {
+      // Always offline-save immediately
+      this.saveLocal();
+
+      // Try online save if possible
+      if (navigator.onLine) {
         try {
-          const urlObj = new URL(url);
-          const domain = urlObj.hostname.replace('www.', '');
-          const path = urlObj.pathname.split('/').filter(p => p).pop();
-          if (path && path !== domain) return path.replace(/[-_]/g, ' ').replace(/\.(html|php|aspx?)$/i, '');
-          return `Game from ${domain}`;
-        } catch (e) {
-          return 'Untitled Game';
-        }
-      }
-
-      getGameNumber(index) { return (index + 1).toString(); }
-
-      escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-      }
-
-      // ---------------- OFFLINE STORAGE ----------------
-      saveLocal() {
-        try { localStorage.setItem(this.storageKey, JSON.stringify(this.games)); } catch (e) {}
-      }
-
-      loadLocal() {
-        try { return JSON.parse(localStorage.getItem(this.storageKey)) || []; }
-        catch (e) { return []; }
-      }
-
-      // ---------------- ONLINE STORAGE ----------------
-      async loadFromServer() {
-        const res = await fetch(this.apiUrl, { cache: "no-store" });
-        if (!res.ok) throw new Error("Server GET failed");
-        const data = await res.json();
-        return Array.isArray(data) ? data : [];
-      }
-
-      async saveToServer() {
-        const res = await fetch(this.apiUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-mindspark-password": this.PASSWORD
-          },
-          body: JSON.stringify(this.games),
-        });
-        if (!res.ok) {
-          if (res.status === 401) throw new Error("Unauthorized (password mismatch)");
-          throw new Error("Server POST failed");
-        }
-      }
-
-      // Merge strategy (simple):
-      // If one list is longer, keep it. If same length, keep server version.
-      mergeLists(localList, serverList) {
-        if (localList.length > serverList.length) return { merged: localList, pushLocalToServer: true };
-        return { merged: serverList, pushLocalToServer: false };
-      }
-
-      async syncFromServer(silent = true) {
-        if (!navigator.onLine) return;
-        try {
-          const serverGames = await this.loadFromServer();
-          const localGames = this.games || [];
-
-          const { merged, pushLocalToServer } = this.mergeLists(localGames, serverGames);
-
-          this.games = merged;
-          this.saveLocal();
-          this.renderGames();
-          this.updateStats();
-
-          if (pushLocalToServer) {
-            await this.saveToServer();
-          }
-
-          if (!silent) this.showNotification("Synced ✅", "success");
+          await this.saveToServer();
         } catch (e) {
           console.error(e);
-          if (!silent) this.showNotification("Sync failed (check Netlify setup)", "error");
         }
       }
+    }
 
-      async persistAndMaybeSync() {
-        // Always offline-save immediately
-        this.saveLocal();
+    // ---------------- UI ----------------
+    getVisibleGames() {
+      return (this.games || []).filter((g) => !g.deleted);
+    }
 
-        // Try online save if possible
-        if (navigator.onLine) {
-          try {
-            await this.saveToServer();
-          } catch (e) {
-            console.error(e);
-            // Keep local; will sync later
-          }
-        }
+    renderGames() {
+      const container = document.getElementById("gamesGrid");
+      const visible = this.getVisibleGames();
+
+      if (!visible || visible.length === 0) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <div>🎯</div>
+            <h3>No games saved yet</h3>
+            <p>Add your first game link below to get started!</p>
+          </div>
+        `;
+        return;
       }
 
-      // ---------------- UI ----------------
-      renderGames() {
-        const container = document.getElementById('gamesGrid');
+      container.innerHTML = visible
+        .map(
+          (game, index) => `
+        <div class="game-card" onclick="window.open('${game.url}', '_blank')">
+          <button class="delete-btn" onclick="event.stopPropagation(); gameApp.deleteGame(${game.id})" title="Delete '${this.escapeHtml(game.title)}'">×</button>
+          <div class="game-header">
+            <div class="game-icon">${this.getGameNumber(index)}</div>
+            <div class="game-header-title">${this.escapeHtml(game.title)}</div>
+          </div>
+          <div class="game-info">
+            ${
+              game.description
+                ? `<div class="game-description">${this.escapeHtml(game.description)}</div>`
+                : ""
+            }
+          </div>
+        </div>
+      `
+        )
+        .join("");
+    }
 
-        if (!this.games || this.games.length === 0) {
-          container.innerHTML = `
-            <div class="empty-state">
-              <div>🎯</div>
-              <h3>No games saved yet</h3>
-              <p>Add your first game link below to get started!</p>
-            </div>
-          `;
-          return;
-        }
+    updateStats() {
+      const count = this.getVisibleGames().length;
+      document.getElementById("statsText").textContent = `📊 ${count} game${
+        count !== 1 ? "s" : ""
+      } saved`;
+    }
 
-        container.innerHTML = this.games.map((game, index) => `
-          <div class="game-card" onclick="window.open('${game.url}', '_blank')">
-            <button class="delete-btn" onclick="event.stopPropagation(); gameApp.deleteGame(${game.id})" title="Delete '${this.escapeHtml(game.title)}'">×</button>
-            <div class="game-header">
-              <div class="game-icon">${this.getGameNumber(index)}</div>
-              <div class="game-header-title">${this.escapeHtml(game.title)}</div>
-            </div>
-            <div class="game-info">
-              ${game.description ? `<div class="game-description">${this.escapeHtml(game.description)}</div>` : ''}
+    clearForm() {
+      document.getElementById("gameUrl").value = "";
+      document.getElementById("gameTitle").value = "";
+      document.getElementById("gameDescription").value = "";
+    }
+
+    showNotification(message, type = "info") {
+      const notification = document.createElement("div");
+      const bgColor =
+        type === "success" ? "#10b981" : type === "error" ? "#ef4444" : "#667eea";
+
+      notification.textContent = message;
+      notification.style.cssText = `
+        position: fixed;
+        top: 20px; left: 20px; right: 20px;
+        background: ${bgColor};
+        color: white;
+        padding: 14px 20px;
+        border-radius: 12px;
+        box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+        z-index: 9999;
+        font-weight: 700;
+        text-align: center;
+        max-width: 420px;
+        margin: 0 auto;
+      `;
+      document.body.appendChild(notification);
+      setTimeout(() => notification.remove(), 2400);
+    }
+
+    async requestPassword(title, message) {
+      return new Promise((resolve) => {
+        const modal = document.createElement("div");
+        modal.className = "password-modal";
+        modal.innerHTML = `
+          <div class="password-dialog">
+            <h3>🔐 ${title}</h3>
+            <p>${message}</p>
+            <input type="password" class="password-input" placeholder="Enter password" maxlength="20" autocomplete="off">
+            <div class="password-buttons">
+              <button class="password-btn cancel">Cancel</button>
+              <button class="password-btn confirm">Confirm</button>
             </div>
           </div>
-        `).join('');
-      }
-
-      updateStats() {
-        const count = (this.games || []).length;
-        document.getElementById('statsText').textContent = `📊 ${count} game${count !== 1 ? 's' : ''} saved`;
-      }
-
-      clearForm() {
-        document.getElementById('gameUrl').value = '';
-        document.getElementById('gameTitle').value = '';
-        document.getElementById('gameDescription').value = '';
-      }
-
-      showNotification(message, type = 'info') {
-        const notification = document.createElement('div');
-        const bgColor = type === 'success' ? '#10b981' : type === 'error' ? '#ef4444' : '#667eea';
-
-        notification.textContent = message;
-        notification.style.cssText = `
-          position: fixed;
-          top: 20px; left: 20px; right: 20px;
-          background: ${bgColor};
-          color: white;
-          padding: 14px 20px;
-          border-radius: 12px;
-          box-shadow: 0 8px 25px rgba(0,0,0,0.15);
-          z-index: 9999;
-          font-weight: 700;
-          text-align: center;
-          max-width: 420px;
-          margin: 0 auto;
         `;
-        document.body.appendChild(notification);
-        setTimeout(() => notification.remove(), 2400);
-      }
+        document.body.appendChild(modal);
 
-      async requestPassword(title, message) {
-        return new Promise((resolve) => {
-          const modal = document.createElement('div');
-          modal.className = 'password-modal';
-          modal.innerHTML = `
-            <div class="password-dialog">
-              <h3>🔐 ${title}</h3>
-              <p>${message}</p>
-              <input type="password" class="password-input" placeholder="Enter password" maxlength="20" autocomplete="off">
-              <div class="password-buttons">
-                <button class="password-btn cancel">Cancel</button>
-                <button class="password-btn confirm">Confirm</button>
-              </div>
-            </div>
-          `;
-          document.body.appendChild(modal);
+        const input = modal.querySelector(".password-input");
+        const cancelBtn = modal.querySelector(".cancel");
+        const confirmBtn = modal.querySelector(".confirm");
 
-          const input = modal.querySelector('.password-input');
-          const cancelBtn = modal.querySelector('.cancel');
-          const confirmBtn = modal.querySelector('.confirm');
+        setTimeout(() => input.focus(), 80);
 
-          setTimeout(() => input.focus(), 80);
-
-          cancelBtn.addEventListener('click', () => { modal.remove(); resolve(false); });
-          confirmBtn.addEventListener('click', () => {
-            const password = input.value.trim();
-            modal.remove();
-            resolve(password === this.PASSWORD);
-          });
-
-          modal.addEventListener('click', (e) => {
-            if (e.target === modal) { modal.remove(); resolve(false); }
-          });
-
-          input.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') confirmBtn.click();
-          });
+        cancelBtn.addEventListener("click", () => {
+          modal.remove();
+          resolve(false);
         });
+
+        confirmBtn.addEventListener("click", () => {
+          const password = input.value.trim();
+          modal.remove();
+          resolve(password === this.PASSWORD);
+        });
+
+        modal.addEventListener("click", (e) => {
+          if (e.target === modal) {
+            modal.remove();
+            resolve(false);
+          }
+        });
+
+        input.addEventListener("keypress", (e) => {
+          if (e.key === "Enter") confirmBtn.click();
+        });
+      });
+    }
+
+    async addGame() {
+      const url = document.getElementById("gameUrl").value.trim();
+      const title = document.getElementById("gameTitle").value.trim();
+      const description = document.getElementById("gameDescription").value.trim();
+
+      if (!url) {
+        this.showNotification("Please enter a valid game URL", "error");
+        return;
+      }
+      if (!this.isValidURL(url)) {
+        this.showNotification("URL must start with http:// or https://", "error");
+        return;
       }
 
-      async addGame() {
-        const url = document.getElementById('gameUrl').value.trim();
-        const title = document.getElementById('gameTitle').value.trim();
-        const description = document.getElementById('gameDescription').value.trim();
-
-        if (!url) { this.showNotification('Please enter a valid game URL', 'error'); return; }
-        if (!this.isValidURL(url)) { this.showNotification('URL must start with http:// or https://', 'error'); return; }
-
-        const ok = await this.requestPassword('Save Game', 'Enter password to save this game');
-        if (!ok) { this.showNotification('Wrong password', 'error'); return; }
-
-        const addBtn = document.getElementById('addGameBtn');
-        const btnText = document.getElementById('btnText');
-        addBtn.disabled = true;
-        btnText.innerHTML = '<span class="loading"></span> Saving...';
-
-        try {
-          const gameData = {
-            id: Date.now(),
-            url,
-            title: title || this.extractTitleFromURL(url),
-            description: description || '',
-            dateAdded: new Date().toISOString()
-          };
-
-          // add locally first
-          this.games.unshift(gameData);
-          await this.persistAndMaybeSync();
-
-          this.renderGames();
-          this.updateStats();
-          this.clearForm();
-
-          if (navigator.onLine) this.showNotification('Saved & synced ✅', 'success');
-          else this.showNotification('Saved offline ✅ (will sync when online)', 'success');
-
-        } catch (e) {
-          console.error(e);
-          this.showNotification('Save failed', 'error');
-        } finally {
-          addBtn.disabled = false;
-          btnText.textContent = '💾 Save Game';
-        }
+      const ok = await this.requestPassword("Save Game", "Enter password to save this game");
+      if (!ok) {
+        this.showNotification("Wrong password", "error");
+        return;
       }
 
-      async deleteGame(id) {
-        const gameToDelete = (this.games || []).find(g => g.id === id);
-        const name = gameToDelete ? gameToDelete.title : 'this game';
+      const addBtn = document.getElementById("addGameBtn");
+      const btnText = document.getElementById("btnText");
+      addBtn.disabled = true;
+      btnText.innerHTML = '<span class="loading"></span> Saving...';
 
-        const ok = await this.requestPassword('Delete Game', `Enter password to delete "${name}"`);
-        if (!ok) { this.showNotification('Wrong password', 'error'); return; }
+      try {
+        const now = new Date().toISOString();
+        const gameData = {
+          id: Date.now(),
+          url,
+          title: title || this.extractTitleFromURL(url),
+          description: description || "",
+          dateAdded: now,
+          updatedAt: now,
+          deleted: false,
+        };
 
-        if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
-
-        this.games = (this.games || []).filter(g => g.id !== id);
+        // Add locally first
+        this.games.unshift(gameData);
         await this.persistAndMaybeSync();
 
         this.renderGames();
         this.updateStats();
+        this.clearForm();
 
-        if (navigator.onLine) this.showNotification('Deleted & synced ✅', 'success');
-        else this.showNotification('Deleted offline ✅ (will sync when online)', 'success');
+        if (navigator.onLine) this.showNotification("Saved & synced ✅", "success");
+        else this.showNotification("Saved offline ✅ (will sync when online)", "success");
+      } catch (e) {
+        console.error(e);
+        this.showNotification("Save failed", "error");
+      } finally {
+        addBtn.disabled = false;
+        btnText.textContent = "💾 Save Game";
       }
     }
 
-    const gameApp = new GameLinkSaver();
+    async deleteGame(id) {
+      const gameToDelete = (this.games || []).find((g) => g.id === id);
+      const name = gameToDelete ? gameToDelete.title : "this game";
 
-    // Register service worker for offline + install (PWA)
-    if ("serviceWorker" in navigator) {
-      window.addEventListener("load", () => {
-        navigator.serviceWorker.register("/service-worker.js").catch(console.error);
-      });
+      const ok = await this.requestPassword("Delete Game", `Enter password to delete "${name}"`);
+      if (!ok) {
+        this.showNotification("Wrong password", "error");
+        return;
+      }
+
+      if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
+
+      // ✅ SOFT DELETE (FIX)
+      const now = new Date().toISOString();
+      const g = (this.games || []).find((x) => x.id === id);
+      if (g) {
+        g.deleted = true;
+        g.updatedAt = now;
+      }
+
+      await this.persistAndMaybeSync();
+      this.renderGames();
+      this.updateStats();
+
+      if (navigator.onLine) this.showNotification("Deleted & synced ✅", "success");
+      else this.showNotification("Deleted offline ✅ (will sync when online)", "success");
     }
-  </script>
+  }
+
+  const gameApp = new GameLinkSaver();
+
+  // Register service worker for offline + install (PWA)
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/service-worker.js").catch(console.error);
+    });
+  }
+</script>
 </body>
 
 </html>
+
